@@ -19,6 +19,12 @@ publicly released** — where the hard parts were not game APIs but dependency p
 generated documentation pipeline (§14), and a build that had to enforce its own invariants (§15).
 Lessons marked "(fork cycle)" come from there; everything else held across both projects.*
 
+*Third cycle (2026-10/11, maintenance): two mods kept alive across four game releases (1.0.16 → 1.0.21),
+a multiplayer state-propagation bug that took four releases to understand, a peer mod audited
+read-only, and the game-update triage that became §19. Lessons marked "(maintenance cycle)" come from
+there. The most expensive one is not an API fact: it is §8's rule about not shipping a fix built on
+inference.*
+
 **Prime directive: never guess about game behaviour.** The game assembly, every installed mod's DLL and
 source, the player's log, and the config files are all readable. Read them. A statement about the game
 that came from memory or a wiki rather than from an artifact is a liability.
@@ -38,13 +44,14 @@ rather than *which product does it*. Load it under whatever agent runtime you us
 that frontmatter if you are pasting the body into a chat window.
 
 The scaffolding sections are Valheim-specific (§1, §2, §5, §10), while the method sections generalise:
-§3–§4 to any HarmonyX/Unity mod, §7–§12 to almost any AI-assisted coding task on Windows, and §13–§18
-(forking/provenance, the documentation pipeline, reproducible builds, re-verification) to any mod you
-did not write from scratch.
+§3–§4 to any HarmonyX/Unity mod, §7–§12 to almost any AI-assisted coding task on Windows, and
+§13–§19 (forking/provenance, the documentation pipeline, reproducible builds, re-verification,
+game-update triage) to any mod you did not write from scratch or have to keep alive.
 
 Helper tooling that assists this skill in its work — the IL/decompile probe of §9, log-grep helpers — is
-something you build on demand. If you bundle such tools with this skill, keep them beside this file under
-`./scripts/`.
+something you build on demand. Ready-made probes ship beside this file under `./scripts/`, with their
+exact invocations and traps in `scripts/README.md`; keep any additions there too, so they travel with the
+skill.
 
 **Working rules that make it portable**
 
@@ -66,7 +73,7 @@ something you build on demand. If you bundle such tools with this skill, keep th
 - **This skill is self-contained.** It requires no other files; the tooling described in §9 is
   something you build on demand.
 
-**The doctrine in twelve lines** (the rest of the file is the justification)
+**The doctrine in fourteen lines** (the rest of the file is the justification)
 
 1. Read the artifact before forming a theory — IL, log, config, DLL.
 2. A plugin on disk is not a plugin loaded; a config on disk is not the value in force.
@@ -82,6 +89,8 @@ something you build on demand. If you bundle such tools with this skill, keep th
 10. Their game, their log, their call — hand over a checklist, not a claim.
 11. Know which artifacts are generated and which are hand-maintained; never let one overwrite the other.
 12. A fork owes its origin: credit it, track what upstream has that you lack, and keep the old identity alive for migration.
+13. Measure before you fix: IL explains the mechanism, never which peer's copy was wrong (§8).
+14. A game update is a diff, not a rumour: quantify the API delta before writing any code (§19).
 
 ---
 
@@ -145,9 +154,18 @@ Do these before writing any code. Each one has saved days on real projects.
 | Build entry point | the project's *one* build/package script (e.g. `tools\Build.ps1`) — the only sanctioned way to compile or package |
 | Version single source | a code constant (e.g. `ModInfo.cs`) that every manifest and the changelog must match |
 | Generated docs | templates (T4 or otherwise) + their *tracked* outputs — never hand-edit the output, never regenerate over hand-written sections |
+| Steam install manifest | `<steam>\steamapps\appmanifest_892970.acf` → a `buildid` and nothing semantic |
+| Game patch notes | `https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=892970&count=8&maxlength=6000` → `appnews.newsitems` (title/date/contents). `maxlength` must be ≥ 6000 or the notes are truncated mid-sentence |
 
 Useful: `BepInEx` output is per-profile, so two profiles can disagree about what is installed. Always
 identify the profile first.
+
+**A game build has no version string to read.** Valheim does not embed its version in
+`assembly_valheim.dll` or in `globalgamemanagers` (ASCII and UTF-16 scans find only the assembly's own
+`1.0.0`), and `Valheim.exe`'s FileVersion is the **Unity** version. Identify a build by the Steam
+`buildid`, the modification timestamps of the `Managed` assemblies, and the official notes — and write
+the *game version you tested against* into the mod's own changelog, because the artifact will not tell
+you.
 
 ---
 
@@ -180,6 +198,17 @@ identify the profile first.
 6. **Never let start-up code throw before patching.** Wrap config initialisation, resolve optional
    dependencies defensively, and set an "enabled" flag rather than aborting `Awake`.
 
+7. **Make the above mechanical instead of remembered:** `scripts/Test-PatchTargets.ps1` (§9) reads the
+   built DLL and fails when any `[HarmonyPatch]` target type, patched method name, or `___field`
+   injection no longer exists in the reference assemblies. Run it straight after every build.
+
+8. **A patch count is only evidence against an expected inventory.** "22 patches, 0 errors" looks
+   healthy, and on a real report it *was* the bug: the piece in question was never patched at all, and
+   nothing failed. Keep the list of types and methods you expect to patch, assert each one is in
+   `Harmony.GetPatchedMethods()` (or let `scripts/Test-PatchTargets.ps1` do it statically), and log the
+   *names*. A count that is lower than your inventory is the finding — including the case where the
+   target keeps a private entry point (a station's `OnAddFuel`) that no patch of yours touches.
+
 ---
 
 ## 4. The publicized-assembly trap
@@ -194,8 +223,13 @@ compile. The shipped game has those members `private` or `internal`.
   being unresolvable at runtime — at best dead code, at worst throwing out of a patch on a vanilla
   method and breaking that interaction for the player.
 - How to check, per member: decompile the shipping assembly and read the accessibility
-  (`cecil.ps1 -Type X -Method Y -Definitions`-style probe). Fields too — a probe that omits theirs is
+  (`scripts/cecil.ps1 -Type X -Method Y -Fields`-style probe). Fields too — a probe that omits theirs is
   an incomplete check.
+- **Compiling against the publicized reference is only half of it: the runtime must permit the
+  access.** On Mono that also needs the publicizer's assembly attribute, normally shipped as
+  `Properties/IgnoreAccessModifiers.cs`:
+  `[assembly: SecurityPermission(SecurityAction.RequestMinimum, SkipVerification = true)]`. Without it,
+  code that builds fine against the publicized reference can still throw at the access in-game.
 - Prefer **removing** a non-public dependency over reflecting it: a public equivalent is usually
   available (e.g. an inventory lookup instead of a private search helper). Reflect only when there is
   no public path, and always inside a `try`, cached in a `static readonly`, never throwing from a patch.
@@ -234,17 +268,36 @@ verification is the durable part.
 - **Stations have no inventory.** A fireplace/smelter/cooking station exposes no `Inventory`; the
   game feeds them through their own RPCs and consumes from the *player's* inventory. Design any
   "feed from storage" feature around that, not around a hoped-for container.
+- **Each station has its own private feed path; enumerate them, never generalise.** Smelters, blast
+  furnaces, cooking stations and shield generators do not share one "add fuel" entry point.
+  `ShieldGenerator.Interact` is the **attack** action, while its fuel arrives through a private
+  `OnAddFuel(Switch, Humanoid, ItemData)` that `Start` wires into the station's add-fuel `Switch`
+  (and a private `OnHoverAddFuel()` supplies the prompt). A patch set that covers every smelter can
+  therefore be complete and still miss a station entirely — the "22 patches, 0 errors" failure of §3.8.
+- **Minimap pins: a custom `PinType` works, but two vanilla behaviours will undo it.** `Minimap.AddPin`
+  is public and `GetSprite` resolves the icon with a `Find` on the enum value, so appending a
+  `SpriteData` with a value past the vanilla range is enough to get an icon. Then: `Minimap.Start()`
+  rebuilds `m_visibleIconTypes` as `new bool[Enum.GetValues(typeof(PinType)).Length]`, so a custom
+  type must re-grow that array on every refresh (Start can run after your first install); and
+  `UpdatePins` re-tints every pin's `m_iconElement.color` on each pass, so a custom colour needs a
+  postfix or the game overwrites it. `GetClosestPin` skips pins whose `m_save` is false, so creating
+  yours unsaved (`save: false, ownerID: 0`) keeps vanilla from dragging or deleting them *and* stops
+  them fading with the shared map. Tint a **white** glyph: tinting a coloured sprite only darkens it.
 - **Drawer-style storage mods** (KG Item Drawers) keep one prefab and an amount on the object's ZDO
   (`"Prefab"`, `"Amount"`, `"Quality"`) and mutate only through their own RPCs. Read the ZDO for
   counting; use their removal RPC for taking; never write their ZDO.
 - **Custom UI panels need a priority and an escape hatch (fork cycle).** A panel added with a bare
   `AddComponent<UIGroupHandler>()` defaults `m_groupPriority` to 0, and `UIGroupHandler.Update` makes the
   panel non-interactive whenever *any other* active handler has a strictly higher priority — so a
-  background HUD silently swallows every click while the panel still looks open. Add the `CanvasGroup`
-  **before** the `UIGroupHandler` (its `Awake` does `GetComponent<CanvasGroup>()`) and set
-  `m_groupPriority` above the ambient panels. If you also hold `GUIManager.BlockInput(true)` while the
-  panel is up, you **must** handle Escape yourself, or the game menu is unreachable and the player has to
-  force-quit. `GUIManager.BlockInput` is ref-counted and a no-op outside the `main` scene.
+  background HUD silently swallows every click while the panel still looks open. The durable fix is
+  **not** to attach your own `CanvasGroup`: `Update` null-checks `m_canvasGroup` and skips the
+  `interactable` write entirely when it is absent, so nothing can disable you (an earlier attempt added
+  the `CanvasGroup` and raised `m_groupPriority` to 100 — strictly weaker, because any panel at a higher
+  priority still won). Keep the `UIGroupHandler` and a high priority for gamepad default-element
+  handling, but leave the `CanvasGroup` null. If you also hold `GUIManager.BlockInput(true)` while the
+  panel is up, you **must** handle Escape yourself in the panel's first input line, or the game menu is
+  unreachable and the player has to force-quit. `GUIManager.BlockInput` is ref-counted and a no-op
+  outside the `main` scene.
 - **Server-authoritative config is not something to hand-roll (fork cycle).** Mark the entries the server
   owns and let the framework's sync push them (Jötunn: `ConfigurationManagerAttributes { IsAdminOnly =
   true }` on a plugin with `[SynchronizationMode(AdminOnlyStrictness.Always)]`). Only those entries sync,
@@ -291,6 +344,18 @@ Most "my mod is broken" reports are really "two mods disagree". The durable prin
 - **A dependency's gate applies to more than storage.** If a mod only exposes extra capability inside a
   semantic window (a crafting context, a permission scope), reading the underlying state outside that
   window gives a different answer than the mod will act on — and the same is true of its config values.
+- **Neutralise an older sibling plugin instead of hoping it stays quiet (maintenance cycle).** When your
+  mod supersedes an ancestor or the fork it came from, both may be installed (an update does not delete
+  the old plugin's folder). Declare a **soft** `[BepInDependency(oldGuid, SoftDependency)]` *first* —
+  that is what guarantees the old plugin is loaded and instantiated before your `Awake` — then disable
+  its `Instance` and call `Harmony.UnpatchID("<oldGuid>.harmony")` before you patch. Make it idempotent
+  and a no-op when the plugin is absent; a wrong harmony id is harmless, because `UnpatchID` on an
+  unknown id does nothing. Without the soft dependency, load order is undefined and you can run before
+  the plugin you meant to neutralise exists.
+- **Renaming a config key is a migration, not an edit.** Give the new key the *old* key's value as its
+  default: read the raw config file before `Bind`, return the old value when the new key is absent, and
+  leave the old key in the file as an inert leftover. Configs are sticky (§17), so a rename without this
+  silently resets the setting for every existing install.
 
 ---
 
@@ -319,6 +384,15 @@ Most "my mod is broken" reports are really "two mods disagree". The durable prin
   would have caught it, in the same change.*
 - **A test you cannot write is a design smell.** If a decision needs a running game to exercise, it is
   probably hard-coded in a patch; move it to the dependency-free layer first, then test it.
+- **A no-op that reports success is a bug generator (maintenance cycle).** A pull helper returned `true`
+  when it moved zero items (added to satisfy a "the player already holds it" case), and a multi-input
+  station loop that stopped at the first `true` then silently stopped trying the other ores: one fix,
+  one regression, one release apart. Make "nothing moved" a distinct outcome from "satisfied", and test
+  the multi-source loop with a source that is empty.
+- **Aggregate player-facing messages per interaction.** One line naming every item and its count, in the
+  game's own ordering (a station's `m_conversion` order), de-duplicated by prefab — not one message per
+  unit, which thrashes the corner of the screen. Derive the line from the same tally the action used, so
+  a type the display cannot name is reported rather than dropped.
 - **Editor/linter diagnostics are not a build.** "No errors found" has been reported for files the
   compiler then rejected. Run the project's real build (§15) before believing a green editor.
 
@@ -341,11 +415,44 @@ Most "my mod is broken" reports are really "two mods disagree". The durable prin
 - **Read your own log before theorising.** Most "it does nothing" reports are answered by the load
   lines.
 
+### When the IL explains the mechanism but not the state, stop and measure (maintenance cycle)
+
+A decompile tells you how a system is built; it never tells you *which peer's copy was wrong* in the
+report. Shipping that gap as a fix cost a project three releases in a row, the second of which turned a
+display bug into a data-downgrade bug, and the owner's answer was "you are not supposed to guess". The
+protocol:
+
+1. **Revert to the last known-good published behaviour** so the diagnostic build can be trusted, and
+   prove it: `git diff <tag> -- <product dirs>` must show only observation code plus the version.
+2. **Add observation-only instrumentation** behind the existing debug flag: log values and change
+   hooks — no requests, no writes, no ownership changes. With the flag off, behaviour must be identical
+   in intent to the published build.
+3. **Ship ONE diagnostic build**, ask for logs from *both* sides of the scenario, and state per log
+   line which hypothesis it will confirm or kill.
+4. Only then write the failing test and the fix.
+
+Two corollaries from the same thread: **verify the instrument before asking for data** (a debug flag
+defaulting to `false` produced three silent, empty logs and a wasted round trip), and when a log
+contradicts a hypothesis, retire it rather than patching around it a further time.
+
 ---
 
 ## 9. Verification without running the game
 
 Most of the confidence on a project can be bought without launching it.
+
+**Bundled probes (`./scripts/`).** Three need only Mono.Cecil (auto-discovered; `-CecilPath` overrides),
+two need nothing beyond PowerShell, and one needs AssemblyPublicizer. `scripts/README.md` holds the exact
+invocations and the traps each script exists to avoid.
+
+| Script | Answers |
+|---|---|
+| `cecil.ps1` | definitions (overloads + parameter types), call sites, fields with their real access modifiers, and the IL of one method on one type |
+| `dump-api.ps1` | a whole-assembly member dump, so two game versions can be `Compare-Object`-diffed |
+| `Test-PatchTargets.ps1` | does every `[HarmonyPatch]` target, patched method and `___field` still exist in the reference assemblies? |
+| `New-ValheimRefs.ps1` | builds the publicized `.references/<game-version>/` layout a csproj compiles against |
+| `strings.ps1` | is this literal (a GUID, a key name, a prefab, an RPC) actually in this file? ASCII and UTF-16LE, with byte offsets |
+| `Test-ReleaseInvariants.ps1` | do the version constant, every tracked manifest and the changelog agree, and does every data JSON parse? |
 
 - **Decompile and read, don't recall.** A Cecil-based probe that, given an assembly, prints a type's
   methods, fields with access modifiers, a method's IL, and the call sites of a method is the single
@@ -363,6 +470,15 @@ Most of the confidence on a project can be bought without launching it.
 - **Log evidence beats reasoning for runtime questions.** "Does the client see the station update
   immediately after an RPC?" is not answerable from source alone; it is answerable from the owner's log
   and one test.
+- **Verify a claimed probe result by re-running the probe yourself** in a child process, then diffing
+  your output against the claim (`Compare-Object`). A transcript that contains an error does not prove
+  the evidence is missing — and a tool that reported "no callers" may simply have been asked the wrong
+  question (a name-only scan cannot distinguish overloads, §3). Timestamp archaeology is not
+  verification.
+- **Verify string facts on the bytes, not through an attribute reader.** Did the built DLL really embed
+  the soft-dependency GUID, the legacy harmony id, the config section name? `scripts/strings.ps1`
+  answers it decisively and cannot disagree with itself; a Cecil attribute probe can print empty
+  arguments for an attribute that is present.
 - **Be explicit about what still needs a human.** Keep a checklist of in-game checks the owner must run,
   and never report an in-game behaviour as verified on their behalf.
 
@@ -386,7 +502,12 @@ Most of the confidence on a project can be bought without launching it.
 - **GitHub release**: tag then release with the built zip attached. Verify what actually landed from
   the *public API* (`https://api.github.com/repos/<owner>/<repo>/releases`) rather than the local
   state — a public listing also proves the release is published and not still a draft, and comparing
-  the asset's byte size against the local build proves the right file went up.
+  the asset's `digest`/SHA-256 against the local zip proves the right *file* went up (byte size alone
+  can match a rebuild; a digest cannot). Check `/releases/latest` resolves to the tag you mean.
+- **Commit the code with the version bump.** A tree where the changelog and manifests moved but the
+  source did not get committed produces releases whose DLL nobody can rebuild — it happened twice in a
+  row on one project, and the next commit had to document three versions at once. Before tagging: `git
+  status --short` must be clean apart from build output.
 - **Before publishing**: the owner's in-game pass. Publishing, force-pushing, and any remote write are
   **stop-and-ask** actions; a draft release is invisible until published, so prepare drafts freely and
   let the human publish.
@@ -461,6 +582,21 @@ Most of the confidence on a project can be bought without launching it.
   fails with a misleading "does not exist". Use an absolute path, or verify the working directory first.
 - **Stage commits by explicit path.** `git add -A` sweeps up build output and scratch files; review
   `git status --short` and add exactly the paths you mean.
+- **A path that starts with `.` is not a string literal.** `$r=.references\Valheim\1.0.20\Managed\
+  assembly_valheim.dll` makes PowerShell *execute* the path and `$r` stays null, so the next `Test-Path`
+  throws. Single-quote such paths, or use an absolute one.
+- **`\"` does not escape a quote inside a double-quoted string** — use a backtick or an outer
+  single-quoted string. It is invisible until the script is parsed.
+- **Under `Set-StrictMode -Version Latest`, a single result has no `.Count`.** `@()` the pipeline, or the
+  script fails only on the run where exactly one item matched — the run that mattered.
+- **Never put a destructive cmdlet in a probe.** A diagnostic that carried `Remove-Item <dir>` without
+  `-Recurse` raised an interactive "Are you sure?" prompt, was auto-answered, and came within one file
+  lock of recursively deleting the repository. Probes read; deletion is a separate, explicit
+  instruction with `-Recurse -Confirm:$false`.
+- **The open workspace root cannot be renamed from inside the editor.** `Rename-Item` and
+  `[IO.Directory]::Move` fail with "being used by another process" (the file watcher holds it), and
+  moving the shell out does not release it — a repository rename has to be done with the folder closed
+  (§13's re-identification work walks into this every time).
 
 ---
 
@@ -518,6 +654,10 @@ contradict the code — a defect players see.
 - **Enumerate every doc surface a release must touch.** For this ecosystem that is typically the
   Thunderstore README (often in more than one format), a second hand-maintained README, the changelog, and
   the issue templates. Walk the list each release; the build only checks what you taught it to.
+- **Ask git which outputs are tracked, instead of guessing from the folder.** `git ls-files -- '*.md'`
+  separates a generated-but-committed README from a `Release/**` folder that `.gitignore` excludes; a
+  file that is neither is a scratch copy that will silently drift. Mind the pathspec: a bare `manifest.json`
+  matches the repo-root file only — use `:(glob)**/manifest.json` when you mean "all of them".
 - **Write the changelog for the reader, one behaviour at a time.** Give each setting its own section
   describing how it behaves *on its own*; only then add a section on how settings interact. Never explain
   a pre-existing setting solely through a new one. Historical entries keep their release's wording.
@@ -541,6 +681,13 @@ contradict the code — a defect players see.
 - **Validate more than compilation.** Fold the cheap, mechanical checks into the same command:
   well-formed data files (config/translation JSON), presence of the reference assemblies, matching
   manifests. Every invariant you can express as a check should run before a human ever sees the build.
+  If the build script is too project-specific to copy, `scripts/Test-ReleaseInvariants.ps1` is the same
+  checks standalone (version constant ↔ every tracked manifest ↔ changelog, plus JSON), so CI and a
+  one-second post-bump run both work.
+- **A legacy (non-SDK) csproj does not glob.** In an explicit `<Compile Include=...>` project a new
+  `.cs` file compiles only after it is listed; until then the build fails with `CS0103` for a type that
+  plainly exists. Then write the same file into any reference project (docs, tests) that compiles its
+  sources by path, or its output silently misses the change.
 - **Build, then verify the artifact, then decide** (§9). The one command makes the artifact; a separate
   probe reads the IL to confirm what landed.
 - **One bump per change set, in the same change set.** Version and changelog ride with the code (§10);
@@ -587,6 +734,11 @@ contradict the code — a defect players see.
 - Shipping more than one version reference (code vs manifests vs changelog) that disagree.
 - Adding an ungated admin/server short-circuit that bypasses a rule you just added (this exact bug shipped
   once: the host could bypass a restriction it was meant to be subject to).
+- Shipping a "fix" when the evidence explained the mechanism but not the observed state — that is a
+  hypothesis, and it belongs in a log line, not in a release (§8).
+- Reporting a patch count as proof that a feature is patched, without the expected inventory (§3.8).
+- Tagging a release whose source was never committed (the changelog and manifests moved; the code did
+  not), which leaves a published build nobody can reproduce (§10).
 
 ---
 
@@ -605,3 +757,43 @@ contradict the code — a defect players see.
 - Which doc files in *this* repo are generated and which are hand-maintained (§14).
 - The project's single build command and its version single source of truth (§15).
 - Whether a given setting is server-authoritative, and through which sync mechanism.
+- Which game build is actually installed and running (no assembly carries a version string — §2), and
+  whether the reference pack you compile against matches it.
+- Each station's own private feed entry point, and whether your patch set covers every station you
+  claim to support (§3.8, §5).
+- Whether the mod's own debug flag is on when you ask someone for logs — and whether the default is
+  `false`, which makes an empty log the expected outcome rather than a finding (§8).
+
+---
+
+## 19. Surviving a game update (maintenance cycle)
+
+A game patch is the recurring event that breaks mods, and the one task where a wrong answer costs the
+owner a server restart. Treat it as a **diff, not a rumour**: quantify it from artifacts before
+changing any code. This procedure was run for 1.0.17 → 1.0.20 → 1.0.21 at well under an hour each.
+
+1. **Confirm the update is real, locally.** Steam's `buildid` moves and the `Managed` assemblies'
+   timestamps move together. Forum reports of mods breaking are hypotheses; the local install is the
+   fact.
+2. **Read the notes** (§2's Steam news route) to know what to look for, then keep them as a hypothesis
+   generator, never as an answer.
+3. **Dump and diff the API.** `scripts/dump-api.ps1` on the assembly from the *previous* reference pack
+   against the newly shipped one, filtered for compiler-generated noise, and quote the delta: "6
+   removed / 21 added members" is checkable; "looks compatible" is not. Per assembly, because one
+   assembly recompiling with 0/0 says nothing about another.
+4. **Evaluate the delta against your own surface, not the whole API.** `Test-PatchTargets.ps1` for every
+   target, then an IL diff of any method a **transpiler** depends on — a postfix survives body churn, a
+   transpiler does not (§3). Expect a few renames that do not concern you (`ResetVariantIfInvalid` →
+   `EnsureValid`) and say so, rather than reporting "changes found" without a verdict.
+5. **Move the version pin in exactly one place** (the build property the refs and the csproj both read),
+   regenerate the reference pack, rebuild, re-run the checks. Watch for a pack folder whose *name* says
+   one version and whose *contents* are another — it happened, and it invalidated a provenance claim.
+6. **State the consequences a static check cannot cover**: a bumped network-protocol version in
+   `ZNet.RPC_PeerInfo` means patched and unpatched players cannot share a session. That is a
+   compatibility statement for the changelog, not a defect.
+7. **Ship it as a PATCH** whose changelog names the game version tested, the delta in numbers, and the
+   one thing you could not verify statically. That entry is the only record of which game build a mod
+   version was ever run against (§2: the artifact will not tell anyone).
+
+If the delta *is* breaking, the same procedure hands you the exact list of moved members — which is what
+lets §5's facts be re-established instead of guessed at.
