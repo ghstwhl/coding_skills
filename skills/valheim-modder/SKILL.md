@@ -216,20 +216,35 @@ you.
 Modding projects compile against **publicized** copies of the game assemblies so private members
 compile. The shipped game has those members `private` or `internal`.
 
-- **Rule: you may only call a member directly if it is `public` in the *unpublicized*
-  `assembly_valheim.dll`.** Everything else must go through reflection (resolved once, cached, failing
-  closed) or be replaced by an equivalent public call.
-- Why it matters: a publicized reference makes the wrong call *compile and pass every test* while
-  being unresolvable at runtime — at best dead code, at worst throwing out of a patch on a vanilla
-  method and breaking that interaction for the player.
+- **Rule: prefer a member that is `public` in the *unpublicized* `assembly_valheim.dll`.** A direct
+  call to a non-public member is a liability to justify and to record; everything else needs
+  reflection (resolved once, cached, failing closed) or an equivalent public call.
+- **What the runtime actually enforces (measured 2026-11-09, Valheim 1.0.21 / Unity Mono).** A direct
+  IL access to a non-public member of the shipping assembly **does not throw**. Measured with
+  `scripts/nonpublic-refs.ps1` over one stock profile: **22 of 29 hand-written mod assemblies** bind
+  non-public game members (1–199 references each, up to 86 distinct members). That includes private
+  *methods* (`Container.CheckAccess`, `Container.CheckForChanges`, `InventoryGui.SetupDragItem`,
+  `InventoryGui.UpdateCraftingPanel`) and the private fields the whole ecosystem reads
+  (`Container.m_nview`, `Container.m_inUse`, `Character.m_zanim`). Jötunn 2.24, the framework they all
+  depend on, carries 199 such references — and **neither Jötunn nor the released
+  MultiUserChest carries `[assembly: SecurityPermission(..., SkipVerification = true)]`**.
+- **So the hazard is skew, not access.** The member must exist with that exact name *and* signature in
+  the shipping assembly, or the first call throws `MissingMethodException`/`MissingFieldException` at
+  JIT time inside a vanilla method — the worst place to fail, and invisible to a build that compiled
+  against a publicized reference from a different game version. A mod binding 80 private members is
+  therefore not "wrong"; it is **hostage to a game update**. Make the list explicit
+  (`nonpublic-refs.ps1`) so a new game build can be diffed against it (`dump-api.ps1`) in one command,
+  and prefer a public path where one exists (`ZDO.set_DataRevision` is public where
+  `IncreaseDataRevision` is not).
 - How to check, per member: decompile the shipping assembly and read the accessibility
-  (`scripts/cecil.ps1 -Type X -Method Y -Fields`-style probe). Fields too — a probe that omits theirs is
-  an incomplete check.
-- **Compiling against the publicized reference is only half of it: the runtime must permit the
-  access.** On Mono that also needs the publicizer's assembly attribute, normally shipped as
-  `Properties/IgnoreAccessModifiers.cs`:
-  `[assembly: SecurityPermission(SecurityAction.RequestMinimum, SkipVerification = true)]`. Without it,
-  code that builds fine against the publicized reference can still throw at the access in-game.
+  (`scripts/cecil.ps1 -Type X -Method Y -Fields`). Fields too — a probe that omits theirs is an
+  incomplete check.
+- **Reported once, not reproduced here: the publicizer's assembly attribute.**
+  `Properties/IgnoreAccessModifiers.cs`,
+  `[assembly: SecurityPermission(SecurityAction.RequestMinimum, SkipVerification = true)]`, was
+  reported as required on Mono for such calls to work. Two shipped mods above bind dozens of private
+  members without it and run in the field, so treat "add the attribute or it throws" as unverified:
+  measure it on the runtime in front of you. It is one line if a stricter runtime turns out to need it.
 - Prefer **removing** a non-public dependency over reflecting it: a public equivalent is usually
   available (e.g. an inventory lookup instead of a private search helper). Reflect only when there is
   no public path, and always inside a `try`, cached in a `static readonly`, never throwing from a patch.
@@ -286,6 +301,24 @@ verification is the durable part.
 - **Drawer-style storage mods** (KG Item Drawers) keep one prefab and an amount on the object's ZDO
   (`"Prefab"`, `"Amount"`, `"Quality"`) and mutate only through their own RPCs. Read the ZDO for
   counting; use their removal RPC for taking; never write their ZDO.
+- **ZDO sync: making a peer reload a ZDO it already has (1.0.21).** `ZDOMan.RPC_ZDOData` applies the
+  payload only when the received `dataRevision > zdo.DataRevision`; if it is not newer but
+  `ownerRevision` is, it applies **owner only** and drops the data; otherwise it drops everything. The
+  *send* side has its own gate — one `PeerZDOInfo` per peer per ZDO — so a bare
+  `ZDOMan.ForceSendZDO` cannot repair a stale copy: on a client it only queues the ZDO for the server
+  (a client has no other peers), and the server's record then decides. To force a refresh, **advance
+  the revision**: `ZDO.IncreaseDataRevision()` (private; the `DataRevision` setter is public) = revision
+  + 1, plus `ZDOMan.ClientChanged` when not the server, plus `SetDirtySector`. `ZDO.Set` only does that
+  when the written value actually changed — so re-saving identical data (`Container.Save()` with an
+  unchanged inventory) is *not* guaranteed to bump anything.
+- **ZDO ownership is not a free "who is in charge" flag (1.0.21).** `ZDO.SetOwner(uid)` bumps only
+  `OwnerRevision`, so peers learn *who* owns it without receiving any data: handing ownership to a peer
+  whose copy lags promotes that lagging copy to authoritative. And `Container.SetInUse` (the only
+  writer of `Container.m_inUse`) returns early unless the local instance is the owner, while
+  `Container.Load` returns early while `m_inUse` is set — so moving a container's ownership away from
+  the player whose GUI is open strands that client with a frozen inventory for the rest of the object's
+  lifetime (`InventoryGui.Hide()`'s `SetInUse(false)` is ignored as well). Multi-user access wants the
+  **data** pushed to the newcomer, never the ownership moved.
 - **Custom UI panels need a priority and an escape hatch (fork cycle).** A panel added with a bare
   `AddComponent<UIGroupHandler>()` defaults `m_groupPriority` to 0, and `UIGroupHandler.Update` makes the
   panel non-interactive whenever *any other* active handler has a strictly higher priority — so a
@@ -441,16 +474,18 @@ contradicts a hypothesis, retire it rather than patching around it a further tim
 
 Most of the confidence on a project can be bought without launching it.
 
-**Bundled probes (`./scripts/`).** Three need only Mono.Cecil (auto-discovered; `-CecilPath` overrides),
-two need nothing beyond PowerShell, and one needs AssemblyPublicizer. `scripts/README.md` holds the exact
-invocations and the traps each script exists to avoid.
+**Bundled probes (`./scripts/`).** Four need only Mono.Cecil (auto-discovered; `-CecilPath` overrides),
+two need nothing beyond PowerShell, and two need their own tool (AssemblyPublicizer, a `dotnet` SDK).
+`scripts/README.md` holds the exact invocations and the traps each script exists to avoid.
 
 | Script | Answers |
 |---|---|
 | `cecil.ps1` | definitions (overloads + parameter types), call sites, fields with their real access modifiers, and the IL of one method on one type |
 | `dump-api.ps1` | a whole-assembly member dump, so two game versions can be `Compare-Object`-diffed |
 | `Test-PatchTargets.ps1` | does every `[HarmonyPatch]` target, patched method and `___field` still exist in the reference assemblies? |
+| `nonpublic-refs.ps1` | which members of the shipping assembly does this build bind to, and which of them are not public (§4) — the private-API surface to re-check after a game update |
 | `New-ValheimRefs.ps1` | builds the publicized `.references/<game-version>/` layout a csproj compiles against |
+| `Compile-Check.ps1` | do these sources still compile when the repo's own build cannot be restored (no `packages\`, no nuget/MSBuild)? writes a throwaway project, prints COMPILE OK + the artifact path |
 | `strings.ps1` | is this literal (a GUID, a key name, a prefab, an RPC) actually in this file? ASCII and UTF-16LE, with byte offsets |
 | `Test-ReleaseInvariants.ps1` | do the version constant, every tracked manifest and the changelog agree, and does every data JSON parse? |
 
@@ -558,6 +593,12 @@ invocations and the traps each script exists to avoid.
   false "no results" from a probe more than once.
 - **`-eq` / `-like` are case-insensitive.** Comparing identifiers that way silently matches
   `ManagedPins` to `managedPins`. Use `-ceq`/`-clike` when case matters.
+- **A type-constrained parameter silently coerces your assignment.** `[string]$Shipping` and a local
+  `$shipping = [Mono.Cecil.AssemblyDefinition]::ReadAssembly($path)` are the *same variable* (names are
+  case-insensitive), and the `[string]` constraint converts the object with `ToString()`. The
+  assignment looks fine; the failure appears much later and points nowhere useful, e.g.
+  `Method invocation failed because [System.String] does not contain a method named 'Dispose'`.
+  Suffix locals (`$shipAsm`) or rename the parameter.
 - **`<` input redirection does not exist**; pipe instead. `2>$null` sometimes does not suppress a
   native command's stderr noise either — wrap stderr in `ForEach-Object { $_.ToString() }` when the
   output matters.

@@ -1,6 +1,6 @@
 # Bundled probes
 
-Six PowerShell scripts that answer questions about Valheim (and about any BepInEx/HarmonyX mod)
+Eight PowerShell scripts that answer questions about Valheim (and about any BepInEx/HarmonyX mod)
 **from artifacts instead of memory**: the game assembly, the installed mod DLLs, the built mod DLL.
 They exist because every fact in `../SKILL.md` had to be established this way, and because each one
 has a trap that has already cost a working session (§"Traps" below).
@@ -9,9 +9,9 @@ They fall into three groups:
 
 | Group | Scripts | Answers |
 |---|---|---|
-| **IL probes** (need Mono.Cecil) | `cecil.ps1`, `dump-api.ps1`, `Test-PatchTargets.ps1` | what does the code do, is anything left of it, does it still resolve |
+| **IL probes** (need Mono.Cecil) | `cecil.ps1`, `dump-api.ps1`, `Test-PatchTargets.ps1`, `nonpublic-refs.ps1` | what does the code do, is anything left of it, does it still resolve, what private surface does the build bind to |
 | **Artifact assertions** (no dependencies) | `strings.ps1`, `Test-ReleaseInvariants.ps1` | is this string in this build, do the version files agree |
-| **Build scaffolding** | `New-ValheimRefs.ps1` | the publicized reference layout a csproj compiles against |
+| **Build scaffolding** | `New-ValheimRefs.ps1`, `Compile-Check.ps1` | the publicized reference layout a csproj compiles against, and a compile when the repo's own build cannot be restored |
 
 Copy this folder into a mod repo as `tools/`, or call the scripts where they are:
 
@@ -22,11 +22,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\cecil.ps1 -Assembl
 ## Requirements
 
 - Windows PowerShell 5.1 (no modules, no Python, no Node).
-- **Mono.Cecil.dll** for the three IL probes. It is discovered automatically:
+- **Mono.Cecil.dll** for the four IL probes. It is discovered automatically:
   `-CecilPath` → `$env:CECIL_PATH` → `<NuGet cache>\jotunnlib\<ver>\build\Mono.Cecil.dll` →
   `Mono.Cecil.dll` next to the script. You almost certainly already have it: it ships inside the
   JötunnLib NuGet package and in `<Valheim>\BepInEx\core`.
 - **AssemblyPublicizer** for `New-ValheimRefs.ps1` only (`-PublicizerPath`, or `-BuildPublicizer`).
+- A **`dotnet` SDK** for `Compile-Check.ps1` only (it drives `dotnet build` on a generated project).
 - `strings.ps1` and `Test-ReleaseInvariants.ps1` need **nothing** beyond PowerShell.
 
 **Not bundled on purpose: the full build pipeline.** A validated `Build.ps1` (restore → validate →
@@ -142,6 +143,63 @@ runtime copy the same version, or a publicized-vs-shipping mismatch shows up as 
 **Pass copies, not the live destinations.** Pointing `-BepInExCorePath` at a folder the script is
 about to write into makes `Copy-Item` fail with "cannot overwrite ... with itself".
 
+## `nonpublic-refs.ps1` — what private game surface does this build bind to?
+
+The bulk version of the §4 question. Scans a built DLL's member references, resolves each one against
+the **shipping** assembly, and prints every reference that is not callable from another assembly
+(member non-public, or its declaring type not public).
+
+```powershell
+# my build, in full
+... nonpublic-refs.ps1 -Mod .\bin\Release\MyMod.dll -MaxExamples 0
+
+# calibrate the rule against released mods that are known to work
+... nonpublic-refs.ps1 -Mod '<profile>\BepInEx\plugins' -MaxExamples 0 -NoExitCode
+```
+
+Why it exists: `cecil.ps1 -Member X` answers "is *this* member public", but the interesting question is
+"what is my whole private-API surface" — that is the list a game update can break, and the list that
+makes a mod version-locked. Keep the output of a release; after a game update, re-run it and diff
+(`dump-api.ps1` tells you what changed, this tells you whether you depend on it).
+
+Measured on Valheim 1.0.21 over one stock profile: 22 of 29 hand-written mod assemblies bind non-public
+members (1–199 references each), Jötunn included — and none of them ship the publicizer's
+`SecurityPermission` attribute. That is why §4 says *prefer public, and record what you keep* rather
+than *it will throw*. Two calibration rules, both learned the hard way:
+
+- **Only count references whose declaring type is scoped to the game assembly.** A mod's own
+  `<PrivateImplementationDetails>::ComputeStringHash` has the same type name the game has, and a scan
+  without the scope check reports it as a private game dependency (it did, before the check was added).
+- **Treat nested/internal declaring types as not callable** even when the member is `public`; the
+  member flag alone is an incomplete check, the same way a field probe without fields is.
+
+Exit code is 1 when anything is found (`-NoExitCode` to always pass), so a build can gate on "no *new*
+private surface" once a baseline is accepted.
+
+## `Compile-Check.ps1` — compile when the repo's own build cannot be restored
+
+Classic csproj + `packages.config` needs `nuget.exe`/MSBuild and a populated `packages\`; an agent
+machine often has neither, and then "can I still compile this?" has no answer. This generates a
+throwaway SDK-style project in `%TEMP%` that compiles the repo's `*.cs` against a `.references`
+layout and runs `dotnet build`.
+
+```powershell
+... Compile-Check.ps1 -RepoRoot C:\repos\MyMod
+... Compile-Check.ps1 -RepoRoot C:\repos\MyMod -SourceRoot C:\repos\MyMod\MyMod `
+    -ExtraReferences "$env:USERPROFILE\.nuget\packages\jotunnlib\2.30.2\lib\net462\Jotunn.dll"
+```
+
+Defaults: newest `<repo>\.references\Valheim\<ver>\assembly_valheim_publicized.dll`, the `Managed`
+folder beside it (or the Steam install), newest `<repo>\.references\BepInEx\<ver>\BepInEx\core`. Pass
+`-Keep` to inspect the project and its output; on success it prints `COMPILE OK` and the artifact path
+for `cecil.ps1` / `nonpublic-refs.ps1`.
+
+What it deliberately is **not**: the release build. No packaging, no version/manifest invariants, no
+Harmony-target check, no transpiler-body check. Its whole output is "the sources bind to these
+references and the compiler accepts them" — necessary, never sufficient (§9). Also note it compiles
+against the **publicized** assembly, so a successful build says nothing about runtime accessibility:
+run `nonpublic-refs.ps1` on the artifact to see what you actually depend on.
+
 ## `strings.ps1` — is that literal in this file?
 
 Scans any file for a literal (or regex), ASCII/UTF-8 and UTF-16LE, with the surrounding context and
@@ -229,3 +287,9 @@ Design notes worth keeping if you adapt it:
   without `-Recurse` raised an interactive "Are you sure?" prompt, was auto-answered, and came within
   one file lock of recursively deleting the repository. Probes read; deletion is a separate, explicit
   instruction.
+- **A type-constrained parameter silently coerces the assignment.** `[string]$Shipping` and a local
+  `$shipping = [Mono.Cecil.AssemblyDefinition]::ReadAssembly(...)` are the *same* variable (names are
+  case-insensitive) and the constraint converts the object through `ToString()`, so the assignment
+  "works" and the failure surfaces later and elsewhere: `Method invocation failed because
+  [System.String] does not contain a method named 'Dispose'`. Same family as the `[switch]` trap above
+  — suffix the locals (`$shipAsm`) or rename the parameter.
